@@ -1,0 +1,12 @@
+[package]
+name = "ydb-ng"
+version = "0.1.0"
+authors = ["Charles Hathaway <charles@yottadb.com>"]
+edition = "2018"
+
+[dependencies]
+clap = "2"
+
+[build-dependencies]
+bindgen = "0.42.2"
+pkg-config = "0.3.14"
