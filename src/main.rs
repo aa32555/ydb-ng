@@ -38,35 +38,79 @@ pub struct Record {
     pub filler: u8,
     pub data: Box<[u8]>
 }
+
 struct State {
     compression: usize,
     matched_so_far: [u8; 1024]
 }
 
-pub struct BlockIterator {
-    data: Read,
+impl Record {
+    // Inteprets this record as a key-value; there should be some
+    //  kind of indication as to whether this is correct or not somewhere,
+    //  but I'm not sure what it is
+    fn ptr(&self) -> usize {
+        let mut key_len = 0;
+        if self.data.len() != 4 {
+            loop {
+                if self.data[key_len] == 0 && self.data[key_len + 1] == 0 {
+                    break;
+                }
+                key_len += 1;
+            }
+            key_len += 2;
+        }
+        let mut index: [u8; 4] = unsafe { mem::zeroed() };
+        index[..4].clone_from_slice(&self.data[key_len..key_len+4]);
+        let index: usize = unsafe { mem::transmute::<[u8; 4], u32>(index) } as usize;
+        return index;
+    }
+
+    fn data(&self) -> Vec<u8> {
+        let data_len = self.data.len();
+        let mut key_len = 0;
+        loop {
+            if self.data[key_len] == 0 && self.data[key_len + 1] == 0 {
+                break;
+            }
+            key_len += 1;
+        }
+        key_len += 2;
+        let mut ret = vec![0; data_len - key_len];
+        for (i, v) in self.data[key_len..].iter().enumerate() {
+            ret[i] = *v;
+        }
+        return ret;
+    }
 }
 
-impl Iterator for BlockIterator {
+impl Iterator for RecordIterator {
     type Item = Record;
 
     fn next(&mut self) -> Option<Record> {
+        // Get a pointer to where we left off in the block
+        let mut data = &self.data[self.offset..];
+        let data = data.by_ref();
+
         let mut rec_size: [u8; 2] = unsafe {mem::zeroed() };
-        if self.data.read_exact(&mut rec_size).is_err() {
+        if data.read_exact(&mut rec_size).is_err() {
             return None
         }
         let rec_size = unsafe { mem::transmute::<[u8; 2], u16>(rec_size) };
+        if rec_size == 0 {
+            return None
+        }
+        self.offset += rec_size as usize;
         let mut rec_compression_count: [u8; 1] = unsafe { mem::zeroed() };
-        if self.data.read_exact(&mut rec_compression_count).is_err() {
+        if data.read_exact(&mut rec_compression_count).is_err() {
             return None
         };
         let mut junk: [u8; 1] = unsafe { mem::zeroed() };
-        if self.data.read_exact(&mut junk).is_err() {
+        if data.read_exact(&mut junk).is_err() {
             return None
         };
         let content_length = rec_size - 4;
         let mut content = vec![0; content_length  as usize];
-        if self.data.read_exact(&mut content.as_mut_slice()).is_err() {
+        if data.read_exact(&mut content.as_mut_slice()).is_err() {
             return None
         };
         let ret = Record{
@@ -115,47 +159,30 @@ impl Block {
     //}
 }
 
-fn read_block(blk_num: usize, input_file: &mut File, fhead: &sgmnt_data_struct) -> std::io::Result<Vec<u8>> {
-    //let mut ret = vec!([0; fhead.blk_size]);
-    let blk_size = fhead.blk_size as usize;
-    let mut ret = vec![0; blk_size];
-    input_file.seek(SeekFrom::Start(
-        (((fhead.start_vbn - 1) * PHYSICAL_DATABASE_BLOCK_SIZE) as usize
-         + blk_size * blk_num) as u64)
-    )?;
-    input_file.read_exact(&mut ret)?;
-    return Ok(ret);
+pub struct RecordIterator {
+    data: Box<[u8]>,
+    offset: usize,
 }
 
-fn read_record<T: Read>(data: &mut T) -> std::io::Result<Record> {
-    let mut rec_size: [u8; 2] = unsafe {mem::zeroed() };
-    data.read_exact(&mut rec_size)?;
-    let rec_size = unsafe { mem::transmute::<[u8; 2], u16>(rec_size) };
-    let mut rec_compression_count: [u8; 1] = unsafe { mem::zeroed() };
-    data.read_exact(&mut rec_compression_count)?;
-    let mut junk: [u8; 1] = unsafe { mem::zeroed() };
-    data.read_exact(&mut junk)?;
-    let content_length = rec_size - 4;
-    let mut content = vec![0; content_length  as usize];
-    data.read_exact(&mut content.as_mut_slice())?;
-    let ret = Record{
-        length: rec_size,
-        compression_count: rec_compression_count[0],
-        filler: junk[0],
-        data: content.into_boxed_slice(),
-    };
-    Ok(ret)
-}
+impl std::iter::IntoIterator for Block {
+    type Item = Record;
+    type IntoIter = RecordIterator;
 
-fn compare(state: &mut State, data: &[u8], goal: &[u8]) -> bool {
-    println!("Data: {:?}", state.compression);
-    let mut index = 0;
-    // Roll back the compression count to 0
-    while state.compression != 0 && data[0] != state.matched_so_far[state.compression] {
-        state.compression = state.compression - 1;
+    fn into_iter(self) -> RecordIterator {
+        RecordIterator{
+            data: self.data,
+            offset: 0,
+        }
     }
+}
+
+fn compare(state: &mut State, record: &Record, goal: &[u8]) -> bool {
+    let mut index = 0;
+    let data = &record.data;
+    // Roll back the compression count to 0
+    state.compression = record.compression_count as usize;
     // Roll forward, copying values to the state
-    while data[index] == goal[state.compression] {
+    while state.compression < goal.len() && data[index] == goal[state.compression] {
         state.matched_so_far[state.compression] = goal[state.compression];
         state.compression = state.compression + 1;
         if data[index] == 0 && data[index+1] == 0 {
@@ -179,8 +206,31 @@ fn main() -> std::io::Result<()> {
              .help("The file to read from")
              .required(true)
              .index(1))
+        .arg(Arg::with_name("global")
+             .help("Global to search the database for")
+             .short("g")
+             .long("global")
+             .takes_value(true))
+        .arg(Arg::with_name("subscripts")
+             .help("Subscript of the key we are searching for")
+             .short("s")
+             .long("subscripts")
+             .takes_value(true))
         .get_matches();
     // Read the header into memory
+    let global = matches.value_of("global").unwrap_or("hello").as_bytes();
+    let subs: Vec<Vec<u8>> = matches.value_of("subscripts").unwrap_or("")
+        .split(",").map(|s| { Vec::from(s) }).collect();
+    let partial_match: Vec<u8> = vec![0, 0xFF];
+    let mut combined_search = Vec::from(global);
+    if matches.value_of("subscripts").is_some() {
+        for sub in subs {
+            combined_search.extend(&partial_match);
+            combined_search.extend(&sub);
+        }
+    }
+    let combined_search = combined_search.into_boxed_slice();
+    //println!("Combined search: {:#?}", combined_search);
     let mut file = File::open(matches.value_of("INPUT").unwrap())?;
     let mut fhead: sgmnt_data_struct = unsafe { mem::zeroed() };
     let buffer_size = mem::size_of::<sgmnt_data_struct>();
@@ -193,87 +243,35 @@ fn main() -> std::io::Result<()> {
     }
     let mut master_bitmap: [u8; 253952] = unsafe { mem::zeroed() };
     file.read_exact(&mut master_bitmap).unwrap();
-    //println!("label: {:#?}", fhead.label);
-    println!("sgmnt_data_struct size: {}", buffer_size);
-    println!("blk_size: {}", fhead.blk_size);
-    println!("start_vbn: {}", fhead.start_vbn);
-    // the first local bitmap is block 0; directory tree is block 1
-    let directory_tree_block = read_block(1, &mut file, &fhead)?;
-    let mut directory_tree_block = directory_tree_block.as_slice();
-    // Read the block header in
-    let mut block_header: blk_hdr = unsafe { mem::zeroed() };
-    let buffer_size = mem::size_of::<blk_hdr>();
-    unsafe {
-        let block_header_slice = slice::from_raw_parts_mut(
-            &mut block_header as *mut _ as *mut u8,
-            buffer_size
-        );
-        directory_tree_block.read_exact(block_header_slice).unwrap();
-    }
-    println!("Transaction number: {}", block_header.tn);
-    // Scan through the directory tree until we find a value greater than the global; jump to that block
-    let record = read_record(directory_tree_block.by_ref())?;
-    /*let mut raw_record_size: [u8; 2] = unsafe { mem::zeroed() };
-    directory_tree_block.read_exact(&mut raw_record_size).unwrap();
-    let record_size = unsafe { mem::transmute::<[u8; 2], u16>(raw_record_size) };
-    println!("Size of first record: {:#?}", record_size);
-    // After reading the directory tree local map, skip ahead to +1000 to get the first "block" with data
-    let mut record_compression_count: [u8; 1] = unsafe { mem::zeroed() };
-    let mut junk: [u8; 1] = unsafe { mem::zeroed() };
-    directory_tree_block.read_exact(&mut record_compression_count).unwrap();
-    directory_tree_block.read_exact(&mut junk).unwrap();
-    let mut data = vec![0; (record_size - 4) as usize];
-    directory_tree_block.read_exact(&mut data.as_mut_slice()).unwrap();
-    let record = Record{
-        length: record_size,
-        compression_count: record_compression_count[0],
-        filler: junk[0],
-        data: data.as_slice(),
-    };*/
-    println!("Record size: {}\nCompression count: {}\nValue: {:#?}", record.length, record.compression_count, record.data);
-    // The first record contains a pointer to another block; I don't know under what
-    //  Circumstances we go past the first pointer (maybe when there are more
-    //  global subscripts than are can fit in that first block?
-    // For now, ready the block pointed too by that
-    let mut cur_block_num = [0; 4];
-    cur_block_num[..4].clone_from_slice(&record.data);
-    let cur_block_num: usize = unsafe { mem::transmute::<[u8; 4], u32>(cur_block_num) } as usize;
-    let cur_block = read_block(cur_block_num, &mut file, &fhead)?;
-    let mut cur_block = cur_block.as_slice();
-    let mut cur_block_header: blk_hdr = unsafe { mem::zeroed() };
-    let buffer_size = mem::size_of::<blk_hdr>();
-    unsafe {
-        let cur_block_header_slice = slice::from_raw_parts_mut(
-            &mut cur_block_header as *mut _ as *mut u8,
-            buffer_size
-        );
-        cur_block.read_exact(cur_block_header_slice).unwrap();
-    }
-    println!("Data block TN is {}", cur_block_header.tn);
-    // We know the exact location of the list of globals; fetch the block, then scan through it
-    //  for a key matching the one we specify
-    let mut state = State{
-        compression: 0,
-        matched_so_far: [0; 1024]
+    let mut database = Database{
+        fhead: fhead,
+        master_bitmap: master_bitmap,
+        handle: file,
     };
-    let goal = "hello";
-    let goal = goal.as_bytes();
-    loop {
-        let record = read_record(cur_block.by_ref())?;
-        if compare(&mut state, &record.data, goal) {
-            //println!("Record size: {}\nCompression count: {}\nValue: {:#?}", record.length, record.compression_count, record.data);
-            // We found the record; get the block with the data for this global
-            // State should have a compression of length + 2 (2 null bytes represent end)
-            let mut cur_block_num = [0; 4];
-            cur_block_num[..4].clone_from_slice(&record.data[state.compression..]);
-            let mut cur_block_num: usize = unsafe { mem::transmute::<[u8; 4], u32>(cur_block_num) } as usize;
-            println!("Next block: {}", cur_block_num);
-            println!("State compression: {}", state.compression);
+    // First block is the index block
+    let block = database.get_block(1)?;
+    let directory_tree: Vec<Record> = block.into_iter().collect();
+    let directory_tree = &directory_tree[0];
+    let mut next_block = directory_tree.ptr();
+    let block = database.get_block(next_block)?;
+    let mut state = State{compression: 0, matched_so_far: [0; 1024]};
+    for globals in block.into_iter() {
+        if compare(&mut state, &globals, global) {
+            next_block = globals.ptr();
             break;
         }
     }
-    /*
-    let record = read_record(cur_block.by_ref())?;
-    println!("Record size: {}\nCompression count: {}\nValue: {:#?}", record.length, record.compression_count, record.data);*/
+    // Now that we know what block a GVT, load up that block
+    let block = database.get_block(next_block)?;
+    // Search in each of the child blocks
+    for data_block_record in block.into_iter() {
+        let block = database.get_block(data_block_record.ptr())?;
+        let mut state = State{compression: 0, matched_so_far: [0; 1024]};
+        for sub in block.into_iter() {
+            if compare(&mut state, &sub, &combined_search) {
+                //println!("Value: {}", String::from_utf8(sub.data()).unwrap());
+            }
+        }
+    }
     Ok(())
 }
