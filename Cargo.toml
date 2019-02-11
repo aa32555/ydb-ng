@@ -7,6 +7,7 @@ edition = "2018"
 [dependencies]
 clap = "2"
 ydb-ng-bridge = { path = "/home/chathaway/programming/ydb-ng-bridge" }
+fnv = "1.0.3"
 
 #[build-dependencies]
 #bindgen = "0.42.2"

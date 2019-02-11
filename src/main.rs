@@ -1,9 +1,11 @@
 //extern crate ydb_ng;
 extern crate clap;
 extern crate ydb_ng_bridge;
+extern crate fnv;
 
 use ydb_ng_bridge::ydb::{sgmnt_data_struct, blk_hdr};
 use clap::{Arg, App};
+use fnv::FnvHashMap;
 
 use std::io::Read;
 use std::mem;
@@ -25,8 +27,10 @@ pub struct Database {
     pub fhead: sgmnt_data_struct,
     pub master_bitmap: [u8; 253952],
     pub handle: File,
+    pub cache: FnvHashMap<usize, Block>,
 }
 
+#[derive(Debug, Clone)]
 pub struct Block {
     pub header: blk_hdr,
     pub data: Box<[u8]>,
@@ -37,6 +41,12 @@ pub struct Record {
     pub compression_count: u8,
     pub filler: u8,
     pub data: Box<[u8]>
+}
+
+pub struct RecordCacheEntry {
+    tn: u64,
+    block_id: usize,
+    value: Box<[u8]>,
 }
 
 struct State {
@@ -124,8 +134,20 @@ impl Iterator for RecordIterator {
 }
 
 impl Database {
+    pub fn get_cache_block_tn(&self, blk_num: usize) -> Option<u64> {
+        if self.cache.contains_key(&blk_num) {
+            let block = self.cache.get(&blk_num).unwrap();
+            return Some(block.header.tn);
+        }
+        None
+    }
+    
     // We should check some sort of cache here for the block
     pub fn get_block(&mut self, blk_num: usize) -> std::io::Result<Block> {
+        if self.cache.contains_key(&blk_num) {
+            let block = self.cache.get(&blk_num).unwrap();
+            return Ok(block.clone())
+        }
         //let mut ret = vec!([0; fhead.blk_size]);
         let blk_size = self.fhead.blk_size as usize;
         let mut raw_block = vec![0; blk_size];
@@ -145,10 +167,12 @@ impl Database {
             block.read_exact(block_header_slice).unwrap();
         }
         let data_portion = Vec::from_iter(raw_block[buffer_size..].iter().cloned());
-        Ok(Block{
+        let block = Block{
             header: block_header,
             data: data_portion.into_boxed_slice(),
-        })
+        };
+        self.cache.insert(blk_num, block.clone());
+        Ok(block)
     }
 }
 
@@ -247,29 +271,55 @@ fn main() -> std::io::Result<()> {
         fhead: fhead,
         master_bitmap: master_bitmap,
         handle: file,
+        cache: FnvHashMap::default(),
     };
-    // First block is the index block
-    let block = database.get_block(1)?;
-    let directory_tree: Vec<Record> = block.into_iter().collect();
-    let directory_tree = &directory_tree[0];
-    let mut next_block = directory_tree.ptr();
-    let block = database.get_block(next_block)?;
-    let mut state = State{compression: 0, matched_so_far: [0; 1024]};
-    for globals in block.into_iter() {
-        if compare(&mut state, &globals, global) {
-            next_block = globals.ptr();
-            break;
+    let mut cacheMap = FnvHashMap::default();
+    for i in 1..10_000_000 {
+        if cacheMap.contains_key(&combined_search) {
+            let cache_entry: &RecordCacheEntry = cacheMap.get(&combined_search).unwrap();
+            //let block = database.get_block(cache_entry.block_id)?;
+            
+            //let block = database.cache.get(&cache_entry.block_id).unwrap();
+            let block_tn = database.get_cache_block_tn(cache_entry.block_id).unwrap();
+            if block_tn == cache_entry.tn {
+                //println!("cache hit");
+                continue;
+            }
+            //println!("cache miss");
         }
-    }
-    // Now that we know what block a GVT, load up that block
-    let block = database.get_block(next_block)?;
-    // Search in each of the child blocks
-    for data_block_record in block.into_iter() {
-        let block = database.get_block(data_block_record.ptr())?;
+        // First block is the index block
+        let block = database.get_block(1)?;
+        let directory_tree: Vec<Record> = block.into_iter().collect();
+        let directory_tree = &directory_tree[0];
+        let mut next_block = directory_tree.ptr();
+        let block = database.get_block(next_block)?;
         let mut state = State{compression: 0, matched_so_far: [0; 1024]};
-        for sub in block.into_iter() {
-            if compare(&mut state, &sub, &combined_search) {
-                //println!("Value: {}", String::from_utf8(sub.data()).unwrap());
+        for globals in block.into_iter() {
+            if compare(&mut state, &globals, global) {
+                next_block = globals.ptr();
+                break;
+            }
+        }
+        // Now that we know what block a GVT, load up that block
+        let block = database.get_block(next_block)?;
+        // Search in each of the child blocks
+        for data_block_record in block.into_iter() {
+            let block = database.get_block(data_block_record.ptr())?;
+            let last_tn = block.header.tn;
+            let mut state = State{compression: 0, matched_so_far: [0; 1024]};
+            for sub in block.into_iter() {
+                if compare(&mut state, &sub, &combined_search) {
+                    //println!("Value: {}", String::from_utf8(sub.data()).unwrap());
+                    let mut t = vec![0; combined_search.len()];
+                    t[..combined_search.len()].clone_from_slice(&combined_search[..]);
+                    cacheMap.insert(t.into_boxed_slice(),
+                                    RecordCacheEntry{
+                                        tn: last_tn,
+                                        block_id: data_block_record.ptr(),
+                                        value: sub.data().into_boxed_slice(),
+                                    });
+                    break;
+                }
             }
         }
     }
