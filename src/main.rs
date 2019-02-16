@@ -1,19 +1,11 @@
-//extern crate ydb_ng;
+extern crate ydb_ng;
 extern crate clap;
 extern crate ydb_ng_bridge;
 extern crate fnv;
 
-use ydb_ng_bridge::ydb::{sgmnt_data_struct, blk_hdr};
 use clap::{Arg, App};
-use fnv::FnvHashMap;
 
-use std::io::Read;
-use std::mem;
-use std::slice;
-use std::fs::File;
-use std::io::prelude::*;
-use std::io::SeekFrom;
-use std::iter::FromIterator;
+use ydb_ng::*;
 
 // File format is:
 //  sgmnt_data_struct
@@ -21,205 +13,6 @@ use std::iter::FromIterator;
 //  - length = sgmnt_data_struct->master_map_len
 // This is the same as ydb::DISK_BLOCK_SIZE, but given a more descriptive name
 // Note that it is hard-coded to 512 in YDB, and is unlikely to change
-static PHYSICAL_DATABASE_BLOCK_SIZE: i32 = 512;
-
-pub struct Database {
-    pub fhead: sgmnt_data_struct,
-    pub master_bitmap: [u8; 253952],
-    pub handle: File,
-    pub cache: FnvHashMap<usize, Block>,
-}
-
-#[derive(Debug, Clone)]
-pub struct Block {
-    pub header: blk_hdr,
-    pub data: Box<[u8]>,
-}
-
-pub struct Record {
-    pub length: u16,
-    pub compression_count: u8,
-    pub filler: u8,
-    pub data: Box<[u8]>
-}
-
-pub struct RecordCacheEntry {
-    tn: u64,
-    block_id: usize,
-    value: Box<[u8]>,
-}
-
-struct State {
-    compression: usize,
-    matched_so_far: [u8; 1024]
-}
-
-impl Record {
-    // Inteprets this record as a key-value; there should be some
-    //  kind of indication as to whether this is correct or not somewhere,
-    //  but I'm not sure what it is
-    fn ptr(&self) -> usize {
-        let mut key_len = 0;
-        if self.data.len() != 4 {
-            loop {
-                if self.data[key_len] == 0 && self.data[key_len + 1] == 0 {
-                    break;
-                }
-                key_len += 1;
-            }
-            key_len += 2;
-        }
-        let mut index: [u8; 4] = unsafe { mem::zeroed() };
-        index[..4].clone_from_slice(&self.data[key_len..key_len+4]);
-        let index: usize = unsafe { mem::transmute::<[u8; 4], u32>(index) } as usize;
-        return index;
-    }
-
-    fn data(&self) -> Vec<u8> {
-        let data_len = self.data.len();
-        let mut key_len = 0;
-        loop {
-            if self.data[key_len] == 0 && self.data[key_len + 1] == 0 {
-                break;
-            }
-            key_len += 1;
-        }
-        key_len += 2;
-        let mut ret = vec![0; data_len - key_len];
-        for (i, v) in self.data[key_len..].iter().enumerate() {
-            ret[i] = *v;
-        }
-        return ret;
-    }
-}
-
-impl Iterator for RecordIterator {
-    type Item = Record;
-
-    fn next(&mut self) -> Option<Record> {
-        // Get a pointer to where we left off in the block
-        let mut data = &self.data[self.offset..];
-        let data = data.by_ref();
-
-        let mut rec_size: [u8; 2] = unsafe {mem::zeroed() };
-        if data.read_exact(&mut rec_size).is_err() {
-            return None
-        }
-        let rec_size = unsafe { mem::transmute::<[u8; 2], u16>(rec_size) };
-        if rec_size == 0 {
-            return None
-        }
-        self.offset += rec_size as usize;
-        let mut rec_compression_count: [u8; 1] = unsafe { mem::zeroed() };
-        if data.read_exact(&mut rec_compression_count).is_err() {
-            return None
-        };
-        let mut junk: [u8; 1] = unsafe { mem::zeroed() };
-        if data.read_exact(&mut junk).is_err() {
-            return None
-        };
-        let content_length = rec_size - 4;
-        let mut content = vec![0; content_length  as usize];
-        if data.read_exact(&mut content.as_mut_slice()).is_err() {
-            return None
-        };
-        let ret = Record{
-            length: rec_size,
-            compression_count: rec_compression_count[0],
-            filler: junk[0],
-            data: content.into_boxed_slice(),
-        };
-        Some(ret)
-    }
-}
-
-impl Database {
-    pub fn get_cache_block_tn(&self, blk_num: usize) -> Option<u64> {
-        if self.cache.contains_key(&blk_num) {
-            let block = self.cache.get(&blk_num).unwrap();
-            return Some(block.header.tn);
-        }
-        None
-    }
-    
-    // We should check some sort of cache here for the block
-    pub fn get_block(&mut self, blk_num: usize) -> std::io::Result<Block> {
-        if self.cache.contains_key(&blk_num) {
-            let block = self.cache.get(&blk_num).unwrap();
-            return Ok(block.clone())
-        }
-        //let mut ret = vec!([0; fhead.blk_size]);
-        let blk_size = self.fhead.blk_size as usize;
-        let mut raw_block = vec![0; blk_size];
-        self.handle.seek(SeekFrom::Start(
-            (((self.fhead.start_vbn - 1) * PHYSICAL_DATABASE_BLOCK_SIZE) as usize
-             + blk_size * blk_num) as u64)
-        )?;
-        self.handle.read_exact(&mut raw_block)?;
-        let mut block = raw_block.as_slice();
-        let mut block_header: blk_hdr = unsafe { mem::zeroed() };
-        let buffer_size = mem::size_of::<blk_hdr>();
-        unsafe {
-            let block_header_slice = slice::from_raw_parts_mut(
-                &mut block_header as *mut _ as *mut u8,
-                buffer_size
-            );
-            block.read_exact(block_header_slice).unwrap();
-        }
-        let data_portion = Vec::from_iter(raw_block[buffer_size..].iter().cloned());
-        let block = Block{
-            header: block_header,
-            data: data_portion.into_boxed_slice(),
-        };
-        self.cache.insert(blk_num, block.clone());
-        Ok(block)
-    }
-}
-
-impl Block {
-    //pub fn find_key(&self, goal: &[u8]) -> Record {
-    //    Record {
-    //    }
-    //}
-}
-
-pub struct RecordIterator {
-    data: Box<[u8]>,
-    offset: usize,
-}
-
-impl std::iter::IntoIterator for Block {
-    type Item = Record;
-    type IntoIter = RecordIterator;
-
-    fn into_iter(self) -> RecordIterator {
-        RecordIterator{
-            data: self.data,
-            offset: 0,
-        }
-    }
-}
-
-fn compare(state: &mut State, record: &Record, goal: &[u8]) -> bool {
-    let mut index = 0;
-    let data = &record.data;
-    // Roll back the compression count to 0
-    state.compression = record.compression_count as usize;
-    // Roll forward, copying values to the state
-    while state.compression < goal.len() && data[index] == goal[state.compression] {
-        state.matched_so_far[state.compression] = goal[state.compression];
-        state.compression = state.compression + 1;
-        if data[index] == 0 && data[index+1] == 0 {
-            break;
-        }
-        index = index + 1;
-        if goal.len() == state.compression && data[index] == 0 && data[index+1] == 0 {
-            state.compression += 2;
-            return true;
-        }
-    }
-    return false;
-}
 
 fn main() -> std::io::Result<()> {
     let matches = App::new("ydb-ng")
@@ -241,7 +34,8 @@ fn main() -> std::io::Result<()> {
              .long("subscripts")
              .takes_value(true))
         .get_matches();
-    // Read the header into memory
+    // Load the database
+    let database = Database::open(matches.value_of("INPUT").unwrap())?;
     let global = matches.value_of("global").unwrap_or("hello").as_bytes();
     let subs: Vec<Vec<u8>> = matches.value_of("subscripts").unwrap_or("")
         .split(",").map(|s| { Vec::from(s) }).collect();
@@ -253,75 +47,17 @@ fn main() -> std::io::Result<()> {
             combined_search.extend(&sub);
         }
     }
-    let combined_search = combined_search.into_boxed_slice();
-    //println!("Combined search: {:#?}", combined_search);
-    let mut file = File::open(matches.value_of("INPUT").unwrap())?;
-    let mut fhead: sgmnt_data_struct = unsafe { mem::zeroed() };
-    let buffer_size = mem::size_of::<sgmnt_data_struct>();
-    unsafe {
-        let fhead_slice = slice::from_raw_parts_mut(
-            &mut fhead as *mut _ as *mut u8,
-            buffer_size
-        );
-        file.read_exact(fhead_slice).unwrap();
-    }
-    let mut master_bitmap: [u8; 253952] = unsafe { mem::zeroed() };
-    file.read_exact(&mut master_bitmap).unwrap();
-    let mut database = Database{
-        fhead: fhead,
-        master_bitmap: master_bitmap,
-        handle: file,
-        cache: FnvHashMap::default(),
+    println!("Combined search: {:#?}",
+             String::from_utf8_lossy(&combined_search));
+    //let combined_search = combined_search.into_boxed_slice();
+    // Find the block containing this subscript
+    let block = database.find_block(&combined_search)?;
+    // Search that block
+    let value = match database.find_value(&combined_search, block) {
+        Ok(val) => val,
+        Err(_) => vec![],
     };
-    let mut cacheMap = FnvHashMap::default();
-    for i in 1..10_000_000 {
-        if cacheMap.contains_key(&combined_search) {
-            let cache_entry: &RecordCacheEntry = cacheMap.get(&combined_search).unwrap();
-            //let block = database.get_block(cache_entry.block_id)?;
-            
-            //let block = database.cache.get(&cache_entry.block_id).unwrap();
-            let block_tn = database.get_cache_block_tn(cache_entry.block_id).unwrap();
-            if block_tn == cache_entry.tn {
-                //println!("cache hit");
-                continue;
-            }
-            //println!("cache miss");
-        }
-        // First block is the index block
-        let block = database.get_block(1)?;
-        let directory_tree: Vec<Record> = block.into_iter().collect();
-        let directory_tree = &directory_tree[0];
-        let mut next_block = directory_tree.ptr();
-        let block = database.get_block(next_block)?;
-        let mut state = State{compression: 0, matched_so_far: [0; 1024]};
-        for globals in block.into_iter() {
-            if compare(&mut state, &globals, global) {
-                next_block = globals.ptr();
-                break;
-            }
-        }
-        // Now that we know what block a GVT, load up that block
-        let block = database.get_block(next_block)?;
-        // Search in each of the child blocks
-        for data_block_record in block.into_iter() {
-            let block = database.get_block(data_block_record.ptr())?;
-            let last_tn = block.header.tn;
-            let mut state = State{compression: 0, matched_so_far: [0; 1024]};
-            for sub in block.into_iter() {
-                if compare(&mut state, &sub, &combined_search) {
-                    //println!("Value: {}", String::from_utf8(sub.data()).unwrap());
-                    let mut t = vec![0; combined_search.len()];
-                    t[..combined_search.len()].clone_from_slice(&combined_search[..]);
-                    cacheMap.insert(t.into_boxed_slice(),
-                                    RecordCacheEntry{
-                                        tn: last_tn,
-                                        block_id: data_block_record.ptr(),
-                                        value: sub.data().into_boxed_slice(),
-                                    });
-                    break;
-                }
-            }
-        }
-    }
+    // Print the value
+    println!("Value: {:#?}", String::from_utf8_lossy(&value));
     Ok(())
 }
