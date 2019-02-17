@@ -151,8 +151,13 @@ impl Database {
         // greater than the value we are looking for
         let mut state = State{compression: 0, matched_so_far: [0; 1024]};
         let mut next_block = 0;
+        let mut global_end = 0;
+        while global_end < item.len() && item[global_end] != 0 {
+            global_end += 1;
+        }
+        let global = &item[0..global_end];
         for record in root_block.into_iter() {
-            let found = match compare(&mut state, &record, &item) {
+            let found = match compare(&mut state, &record, global) {
                 SortOrder::SortsAfter => true,
                 _ => false,
             };
@@ -167,7 +172,7 @@ impl Database {
         let mut state = State{compression: 0, matched_so_far: [0; 1024]};
         let mut next_block = 0;
         for record in gvt_block.into_iter() {
-            let found = match compare(&mut state, &record, &item) {
+            let found = match compare(&mut state, &record, global) {
                 SortOrder::SortsAfter => true,
                 SortOrder::SortsEqual => true,
                 _ => false,
@@ -273,6 +278,42 @@ fn compare(state: &mut State, record: &Record, goal: &[u8]) -> SortOrder {
     if record.length == 8 {
         return SortOrder::SortsAfter;
     }
+
+    let compression_count = record.compression_count as usize;
+    if compression_count < state.compression {
+        return SortOrder::SortsAfter
+    }
+    if compression_count == state.compression {
+        let mut index = 0;
+        let data = &record.data;
+        let data_len = data.len();
+        let goal_len = goal.len();
+        while index < data_len && state.compression < goal_len
+            && data[index] == goal[state.compression] {
+            state.compression += 1;
+            index += 1;
+        }
+        // Case 1: the record key is shorter than goal
+        if index == data_len {
+            return SortOrder::SortsBefore;
+        }
+        // Case 2: the goal key is short than the record
+        if state.compression == goal_len {
+            // If what's left of the record is two 0 bytes, this is they key
+            if data[index] == 0 && data[index+1] == 0 {
+                return SortOrder::SortsEqual;
+            }
+            return SortOrder::SortsAfter;
+        }
+        // Case 3: Same length, different value
+        if data[index] > goal[state.compression] {
+            return SortOrder::SortsAfter;
+        }
+    }
+    return SortOrder::SortsBefore;
+    /*if record.length == 8 {
+        return SortOrder::SortsAfter;
+    }
     let mut index = 0;
     let data = &record.data;
     let compression_count = record.compression_count as usize;
@@ -300,5 +341,5 @@ fn compare(state: &mut State, record: &Record, goal: &[u8]) -> SortOrder {
     if data[index] < goal[state.compression] {
         return SortOrder::SortsBefore;
     }
-    return SortOrder::SortsAfter;
+    return SortOrder::SortsAfter;*/
 }
