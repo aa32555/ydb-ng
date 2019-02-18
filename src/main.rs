@@ -51,12 +51,9 @@ fn main() -> std::io::Result<()> {
              String::from_utf8_lossy(&combined_search));
     //let combined_search = combined_search.into_boxed_slice();
     // Find the block containing this subscript
-    let block = database.find_block(&combined_search)?;
+    let block = database.find_block(&combined_search).unwrap();
     // Search that block
-    let value = match database.find_value(&combined_search, block) {
-        Ok(val) => val,
-        Err(_) => vec![],
-    };
+    let value = database.find_value(&combined_search, block).unwrap();
     // Print the value
     println!("Value: {:#?}", String::from_utf8_lossy(&value));
     Ok(())

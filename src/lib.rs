@@ -7,6 +7,7 @@ use std::fs::File;
 use std::io::prelude::*;
 use std::io::SeekFrom;
 use std::iter::FromIterator;
+use std::io::{Error, ErrorKind};
 
 use ydb_ng_bridge::ydb::{sgmnt_data_struct, blk_hdr};
 
@@ -34,6 +35,34 @@ pub struct Record {
 struct State {
     compression: usize,
     matched_so_far: [u8; 1024]
+}
+
+#[derive(Debug)]
+pub enum ValueError {
+    IoError(std::io::Error),
+    RecordError(RecordError),
+    GlobalNotFound,
+    SubscriptNotFound,
+    MalformedRecord,
+}
+
+#[derive(Debug)]
+pub enum RecordError {
+    IoError(std::io::Error),
+    TooBig,
+    LengthZero,
+}
+
+impl From<std::io::Error> for ValueError {
+    fn from(error: std::io::Error) -> Self {
+        ValueError::IoError(error)
+    }
+}
+
+impl From<RecordError> for ValueError {
+    fn from(error: RecordError) -> Self {
+        ValueError::RecordError(error)
+    }
 }
 
 impl Record {
@@ -76,34 +105,36 @@ impl Record {
 }
 
 impl Iterator for RecordIterator {
-    type Item = Record;
+    type Item = Result<Record, RecordError>;
 
-    fn next(&mut self) -> Option<Record> {
+    fn next(&mut self) -> Option<Result<Record, RecordError>> {
         // Get a pointer to where we left off in the block
         let mut data = &self.data[self.offset..];
         let data = data.by_ref();
 
         let mut rec_size: [u8; 2] = unsafe {mem::zeroed() };
         if data.read_exact(&mut rec_size).is_err() {
-            return None
+            // If there is no more to read from the block, we are done here
+            return None;
         }
         let rec_size = unsafe { mem::transmute::<[u8; 2], u16>(rec_size) };
         if rec_size == 0 {
-            return None
+            // If the rec_size is 0, there are no more records in the block
+            return None;
         }
         self.offset += rec_size as usize;
         let mut rec_compression_count: [u8; 1] = unsafe { mem::zeroed() };
         if data.read_exact(&mut rec_compression_count).is_err() {
-            return None
+            return Some(Err(RecordError::TooBig));
         };
         let mut junk: [u8; 1] = unsafe { mem::zeroed() };
         if data.read_exact(&mut junk).is_err() {
-            return None
+            return Some(Err(RecordError::TooBig));
         };
         let content_length = rec_size - 4;
         let mut content = vec![0; content_length  as usize];
         if data.read_exact(&mut content.as_mut_slice()).is_err() {
-            return None
+            return Some(Err(RecordError::TooBig));
         };
         let ret = Record{
             length: rec_size,
@@ -111,7 +142,7 @@ impl Iterator for RecordIterator {
             filler: junk[0],
             data: content.into_boxed_slice(),
         };
-        Some(ret)
+        Some(Ok(ret))
     }
 }
 
@@ -145,19 +176,22 @@ impl Database {
         Ok(block)
     }
 
-    pub fn find_block(&self, item: &Vec<u8>) -> std::io::Result<Block> {
+    pub fn find_block(&self, item: &Vec<u8>) -> Result<Block, ValueError> {
         let root_block = self.get_block(1)?;
         // Scan through the root block until we find one with key
         // greater than the value we are looking for
         let mut state = State{compression: 0, matched_so_far: [0; 1024]};
         let mut next_block = 0;
         let mut global_end = 0;
+        let mut found = false;
         while global_end < item.len() && item[global_end] != 0 {
             global_end += 1;
         }
+        println!("Searching block {}", next_block);
         let global = &item[0..global_end];
         for record in root_block.into_iter() {
-            let found = match compare(&mut state, &record, global) {
+            let record = record?;
+            found = match compare(&mut state, &record, global) {
                 SortOrder::SortsAfter => true,
                 _ => false,
             };
@@ -166,13 +200,18 @@ impl Database {
                 break;
             }
         }
-        // Now scan for the specific global we are after
+        if !found {
+            return Err(ValueError::MalformedRecord);
+        }
+
         println!("Searching block {}", next_block);
         let gvt_block = self.get_block(next_block)?;
         let mut state = State{compression: 0, matched_so_far: [0; 1024]};
         let mut next_block = 0;
+        found = false;
         for record in gvt_block.into_iter() {
-            let found = match compare(&mut state, &record, global) {
+            let record = record?;
+            found = match compare(&mut state, &record, global) {
                 SortOrder::SortsAfter => true,
                 SortOrder::SortsEqual => true,
                 _ => false,
@@ -182,42 +221,53 @@ impl Database {
                 break;
             }
         }
+        if !found {
+            return Err(ValueError::GlobalNotFound);
+        }
 
-        // Scan for the data block that has what we want
-        let data_block = self.get_block(next_block)?;
-        println!("Searching block {}", next_block);
-        let mut state = State{compression: 0, matched_so_far: [0; 1024]};
-        let mut next_block = 0;
-        for record in data_block.into_iter() {
-            let found = match compare(&mut state, &record, &item) {
-                SortOrder::SortsAfter => true,
-                SortOrder::SortsEqual => true,
-                _ => false,
-            };
-            if found == true {
-                next_block = record.ptr();
+        loop {
+            // Now scan for the specific global we are after
+            println!("Searching block {}", next_block);
+            let gvt_block = self.get_block(next_block)?;
+            println!("Next block level {}", gvt_block.header.levl);
+            if gvt_block.header.levl == 0 {
+                return Ok(gvt_block);
+            }
+
+            let mut state = State{compression: 0, matched_so_far: [0; 1024]};
+            found = false;
+            for record in gvt_block.into_iter() {
+                let record = record?;
+                found = match compare(&mut state, &record, global) {
+                    SortOrder::SortsAfter => true,
+                    SortOrder::SortsEqual => true,
+                    _ => false,
+                };
+                if found == true {
+                    next_block = record.ptr();
+                    break;
+                }
+            }
+            if !found {
                 break;
             }
         }
-
-
-        // And finally, return the block which will contain the data
-        let block = self.get_block(next_block)?;
-        Ok(block)
+        Err(ValueError::SubscriptNotFound)
     }
 
     /// Searches block for item, and return the value or not found
-    pub fn find_value(&self, item: &Vec<u8>, block: Block) -> Result<Vec<u8>, ()> {
+    pub fn find_value(&self, item: &Vec<u8>, block: Block) -> Result<Vec<u8>, ValueError> {
         let mut state = State{compression: 0, matched_so_far: [0; 1024]};
         for record in block.into_iter() {
+            let record = record?;
             let found = compare(&mut state, &record, &item);
             if found == SortOrder::SortsEqual {
                 return Ok(record.data());
             } else if found == SortOrder::SortsAfter {
-                return Err(());
+                return Err(ValueError::SubscriptNotFound);
             }
         }
-        Err(())
+        Err(ValueError::SubscriptNotFound)
     }
 
     pub fn open(path: &str) -> std::io::Result<Database> {
@@ -254,7 +304,7 @@ pub struct RecordIterator {
 }
 
 impl std::iter::IntoIterator for Block {
-    type Item = Record;
+    type Item = Result<Record, RecordError>;
     type IntoIter = RecordIterator;
 
     fn into_iter(self) -> RecordIterator {
@@ -311,35 +361,4 @@ fn compare(state: &mut State, record: &Record, goal: &[u8]) -> SortOrder {
         }
     }
     return SortOrder::SortsBefore;
-    /*if record.length == 8 {
-        return SortOrder::SortsAfter;
-    }
-    let mut index = 0;
-    let data = &record.data;
-    let compression_count = record.compression_count as usize;
-    if compression_count < state.compression {
-        state.compression = compression_count;
-    }
-    // Roll forward, copying values to the state
-    while state.compression < goal.len() && data[index] == goal[state.compression] {
-        state.matched_so_far[state.compression] = goal[state.compression];
-        state.compression = state.compression + 1;
-        if data[index] == 0 && data[index+1] == 0 {
-            break;
-        }
-        index = index + 1;
-        if goal.len() == state.compression && data[index] == 0 && data[index+1] == 0 {
-            state.compression += 2;
-            return SortOrder::SortsEqual;
-        }
-    }
-    // If we have no match
-    if state.compression != 0 {
-        return SortOrder::SortsBefore;
-    }
-    // If have a partial match, but are less than the goal, continue
-    if data[index] < goal[state.compression] {
-        return SortOrder::SortsBefore;
-    }
-    return SortOrder::SortsAfter;*/
 }
