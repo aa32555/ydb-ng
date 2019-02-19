@@ -1,6 +1,8 @@
 #[macro_use]
 extern crate serde;
 extern crate bincode;
+#[macro_use]
+extern crate nom;
 
 extern crate ydb_ng_bridge;
 use serde::{Serialize, Deserialize};
@@ -15,10 +17,27 @@ use std::iter::FromIterator;
 use std::io::{Error, ErrorKind};
 use std::fs::OpenOptions;
 use bincode::serialize;
+use nom::{le_u8, le_u16};
 
 use ydb_ng_bridge::ydb::{sgmnt_data_struct, blk_hdr, rec_hdr};
 
 static PHYSICAL_DATABASE_BLOCK_SIZE: i32 = 512;
+
+#[derive(Debug, Clone)]
+pub struct Rec<'a> {
+    header: rec_hdr,
+    data: &'a [u8]
+}
+
+named!(record_header<&[u8], Rec>,
+       do_parse!(
+           rsiz: le_u16 >>
+           cmpc: le_u8  >>
+           cmpc2: le_u8 >>
+           data: take!(rsiz - 4) >>
+           (Rec{ header: rec_hdr {rsiz, cmpc, cmpc2}, data})
+        )
+);
 
 pub struct Database {
     pub fhead: sgmnt_data_struct,
@@ -63,6 +82,17 @@ pub enum RecordError {
     TooBig,
     LengthZero,
 }
+
+pub struct RecIterator<'a> {
+    data: &'a [u8],
+    block: &'a Block,
+}
+
+pub struct RecordIterator {
+    data: Box<[u8]>,
+    offset: usize,
+}
+
 
 impl From<std::io::Error> for ValueError {
     fn from(error: std::io::Error) -> Self {
@@ -147,6 +177,16 @@ impl Record {
         ret.write(&self.filler.to_le_bytes())?;
         ret.write(&self.data)?;
         return Ok(ret);
+    }
+}
+
+impl<'a> Iterator for RecIterator<'a> {
+    type Item = Result<Rec<'a>, RecordError>;
+
+    fn next(&mut self) -> Option<Result<Rec<'a>, RecordError>> {
+        let (rest, rec) = record_header(self.data).unwrap();
+        self.data = rest;
+        Some(Ok(rec))
     }
 }
 
@@ -431,11 +471,6 @@ impl Block {
     //    Record {
     //    }
     //}
-}
-
-pub struct RecordIterator {
-    data: Box<[u8]>,
-    offset: usize,
 }
 
 impl std::iter::IntoIterator for Block {
