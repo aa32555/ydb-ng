@@ -33,9 +33,14 @@ fn main() -> std::io::Result<()> {
              .short("s")
              .long("subscripts")
              .takes_value(true))
+        .arg(Arg::with_name("value")
+             .help("If present, indicates that the indicated key should be set to value")
+             .short("v")
+             .long("value")
+             .takes_value(true))
         .get_matches();
     // Load the database
-    let database = Database::open(matches.value_of("INPUT").unwrap())?;
+    let mut database = Database::open(matches.value_of("INPUT").unwrap())?;
     let global = matches.value_of("global").unwrap_or("hello").as_bytes();
     let subs: Vec<Vec<u8>> = matches.value_of("subscripts").unwrap_or("")
         .split(",").map(|s| { Vec::from(s) }).collect();
@@ -49,12 +54,21 @@ fn main() -> std::io::Result<()> {
     }
     println!("Combined search: {:#?}",
              String::from_utf8_lossy(&combined_search));
-    //let combined_search = combined_search.into_boxed_slice();
-    // Find the block containing this subscript
-    let block = database.find_block(&combined_search).unwrap();
-    // Search that block
-    let value = database.find_value(&combined_search, block).unwrap();
-    // Print the value
-    println!("Value: {:#?}", String::from_utf8_lossy(&value));
+    let mut set = false;
+    if matches.value_of("value").is_some() {
+        set = true;
+    }
+    if set {
+        let new_value = Vec::from(matches.value_of("value").unwrap());
+        database.set_value(&combined_search, new_value).unwrap();
+    } else {
+        //let combined_search = combined_search.into_boxed_slice();
+        // Find the block containing this subscript
+        let block = database.find_block(&combined_search).unwrap();
+        // Search that block
+        let value = database.find_value(&combined_search, block).unwrap();
+        // Print the value
+        println!("Value: {:#?}", String::from_utf8_lossy(&value));
+    }
     Ok(())
 }

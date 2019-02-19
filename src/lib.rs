@@ -1,4 +1,9 @@
+#[macro_use]
+extern crate serde;
+extern crate bincode;
+
 extern crate ydb_ng_bridge;
+use serde::{Serialize, Deserialize};
 
 use std::io::Read;
 use std::mem;
@@ -8,8 +13,10 @@ use std::io::prelude::*;
 use std::io::SeekFrom;
 use std::iter::FromIterator;
 use std::io::{Error, ErrorKind};
+use std::fs::OpenOptions;
+use bincode::serialize;
 
-use ydb_ng_bridge::ydb::{sgmnt_data_struct, blk_hdr};
+use ydb_ng_bridge::ydb::{sgmnt_data_struct, blk_hdr, rec_hdr};
 
 static PHYSICAL_DATABASE_BLOCK_SIZE: i32 = 512;
 
@@ -21,10 +28,13 @@ pub struct Database {
 
 #[derive(Debug, Clone)]
 pub struct Block {
-    pub header: blk_hdr,
-    pub data: Box<[u8]>,
+    header: blk_hdr,
+    blk_num: usize,
+    data: Box<[u8]>,
 }
 
+#[derive(Serialize, Deserialize, Debug)]
+#[repr(C)]
 pub struct Record {
     pub length: u16,
     pub compression_count: u8,
@@ -32,9 +42,10 @@ pub struct Record {
     pub data: Box<[u8]>
 }
 
+#[derive(Debug, Clone)]
 struct State {
     compression: usize,
-    matched_so_far: [u8; 1024]
+    matched_so_far: Vec<u8>
 }
 
 #[derive(Debug)]
@@ -61,7 +72,10 @@ impl From<std::io::Error> for ValueError {
 
 impl From<RecordError> for ValueError {
     fn from(error: RecordError) -> Self {
-        ValueError::RecordError(error)
+        match error {
+            RecordError::IoError(x) => ValueError::IoError(x),
+            x => ValueError::RecordError(x),
+        }
     }
 }
 
@@ -101,6 +115,38 @@ impl Record {
             ret[i] = *v;
         }
         return ret;
+    }
+
+    /// Creates a new record given a compression state, key, and value
+    fn make(state: &State, key: &Vec<u8>, value: Vec<u8>) -> Record {
+        // There is an assumption here that this key will always sort after the last record in
+        // state
+        let mut compression_count = 0;
+        while compression_count < key.len() && compression_count < state.compression
+            && key[compression_count] == state.matched_so_far[compression_count] {
+            compression_count += 1;
+        }
+        let mut data = Vec::from(&key[compression_count..]);
+        data.append(&mut vec![0, 0]);
+        let mut value = value.clone();
+        data.append(&mut value.clone());
+        let len = data.len() + mem::size_of::<rec_hdr>();
+        Record{
+            length: len as u16,
+            compression_count: compression_count as u8,
+            filler: 0,
+            data: data.into_boxed_slice(),
+        }
+    }
+
+    fn into_boxed_slice(self) -> std::io::Result<Vec<u8>> {
+        println!("Making record value");
+        let mut ret = Vec::with_capacity(self.length as usize);
+        ret.write(&self.length.to_le_bytes())?;
+        ret.write(&self.compression_count.to_le_bytes())?;
+        ret.write(&self.filler.to_le_bytes())?;
+        ret.write(&self.data)?;
+        return Ok(ret);
     }
 }
 
@@ -146,6 +192,16 @@ impl Iterator for RecordIterator {
     }
 }
 
+#[derive(Serialize, Deserialize, Debug)]
+#[repr(C)]
+struct BlkHdrDef {
+    bver: u16,
+    filler: u8,
+    levl: u8,
+    bsiz: u32,
+    tn: u64,
+}
+
 impl Database {
     // We should check some sort of cache here for the block
     pub fn get_block(&self, blk_num: usize) -> std::io::Result<Block> {
@@ -171,16 +227,95 @@ impl Database {
         let data_portion = Vec::from_iter(raw_block[buffer_size..].iter().cloned());
         let block = Block{
             header: block_header,
+            blk_num: blk_num,
             data: data_portion.into_boxed_slice(),
         };
         Ok(block)
+    }
+
+    pub fn write_block(&mut self, old_blk_hdr: &blk_hdr, blk_num: usize, new_value: Vec<u8>) -> std::io::Result<()> {
+        let mut handle = self.handle.try_clone()?;
+        let blk_size = self.fhead.blk_size as usize;
+        let blk_header = BlkHdrDef {
+            bver: old_blk_hdr.bver,
+            filler: 0,
+            levl: old_blk_hdr.levl,
+            bsiz: (new_value.len() + mem::size_of::<blk_hdr>()) as u32,
+            tn: old_blk_hdr.tn + 1,
+        };
+        handle.seek(SeekFrom::Start(
+            (((self.fhead.start_vbn - 1) * PHYSICAL_DATABASE_BLOCK_SIZE) as usize
+             + blk_size * blk_num) as u64)
+        )?;
+        handle.write(&serialize(&blk_header).unwrap())?;
+        handle.write(&new_value)?;
+        println!("New value written for block {}! Length is {}", blk_num, blk_header.bsiz);
+        Ok(())
+    }
+
+    fn make_global_block(&mut self, key: &Vec<u8>) -> Result<Block, ValueError> {
+        let block = self.get_block(10)?;
+        panic!("Not implemented!");
+        //Ok(block)
+    }
+
+    pub fn set_value(&mut self, key: &Vec<u8>, value: Vec<u8>) -> Result<(), ValueError> {
+        let mut new_value = Vec::with_capacity(value.len() + mem::size_of::<rec_hdr>());
+        // Get the block the value should exist in; if we can't find it, create these blocks
+        let value_block = match self.find_block(&key) {
+            Ok(x) => x,
+            Err(ValueError::GlobalNotFound) => self.make_global_block(&key)?,
+            x => x?,
+        };
+        let old_blk_hdr = value_block.header.clone();
+        let old_blk_num = value_block.blk_num;
+        // Go through each record in this block until we get the value or one that is after
+        let mut state = State{compression: 0, matched_so_far: vec![0; 1024]};
+        let mut found = false;
+        let mut previous_state = state.clone();
+        let mut iter = value_block.into_iter();
+        for record in &mut iter {
+            let record = record?;
+            previous_state = state.clone();
+            let cmp = compare(&mut state, &record, key);
+            if cmp == SortOrder::SortsAfter {
+                break;
+            } else if cmp == SortOrder::SortsEqual {
+                found = true;
+                break;
+            }
+            println!("Writing old value");
+            new_value.write(&record.into_boxed_slice()?)?;
+        }
+        // Place the new record
+        if !found {
+            state = previous_state;
+        }
+        // TODO: we need to check for space and allocate a new record, if needed
+        let record = Record::make(&state, &key, value);
+        println!("New record: {:#?}", record);
+        //new_value.write(&serialize(&record).unwrap())?;
+        new_value.write(&record.into_boxed_slice()?);
+        // Skip the old value, if it was found
+        if found {
+            iter.next();
+        }
+        for record in iter {
+            // Place each of the remaining records
+            let record = record?;
+            new_value.write(&record.into_boxed_slice()?)?;
+        }
+        // Finally, write the value
+        println!("Value: {:#?}", String::from_utf8_lossy(&new_value));
+        self.write_block(&old_blk_hdr, old_blk_num, new_value)?;
+        Ok(())
     }
 
     pub fn find_block(&self, item: &Vec<u8>) -> Result<Block, ValueError> {
         let root_block = self.get_block(1)?;
         // Scan through the root block until we find one with key
         // greater than the value we are looking for
-        let mut state = State{compression: 0, matched_so_far: [0; 1024]};
+        let mut state = State{compression: 0, matched_so_far: vec![0; 1024]};
         let mut next_block = 0;
         let mut global_end = 0;
         let mut found = false;
@@ -206,7 +341,7 @@ impl Database {
 
         println!("Searching block {}", next_block);
         let gvt_block = self.get_block(next_block)?;
-        let mut state = State{compression: 0, matched_so_far: [0; 1024]};
+        let mut state = State{compression: 0, matched_so_far: vec![0; 1024]};
         let mut next_block = 0;
         found = false;
         for record in gvt_block.into_iter() {
@@ -234,11 +369,11 @@ impl Database {
                 return Ok(gvt_block);
             }
 
-            let mut state = State{compression: 0, matched_so_far: [0; 1024]};
+            let mut state = State{compression: 0, matched_so_far: vec![0; 1024]};
             found = false;
             for record in gvt_block.into_iter() {
                 let record = record?;
-                found = match compare(&mut state, &record, global) {
+                found = match compare(&mut state, &record, item) {
                     SortOrder::SortsAfter => true,
                     SortOrder::SortsEqual => true,
                     _ => false,
@@ -257,7 +392,7 @@ impl Database {
 
     /// Searches block for item, and return the value or not found
     pub fn find_value(&self, item: &Vec<u8>, block: Block) -> Result<Vec<u8>, ValueError> {
-        let mut state = State{compression: 0, matched_so_far: [0; 1024]};
+        let mut state = State{compression: 0, matched_so_far: vec![0; 1024]};
         for record in block.into_iter() {
             let record = record?;
             let found = compare(&mut state, &record, &item);
@@ -271,7 +406,7 @@ impl Database {
     }
 
     pub fn open(path: &str) -> std::io::Result<Database> {
-        let mut file = File::open(path)?;
+        let mut file = OpenOptions::new().read(true).write(true).open(path)?;
         let mut fhead: sgmnt_data_struct = unsafe { mem::zeroed() };
         let buffer_size = mem::size_of::<sgmnt_data_struct>();
         unsafe {
@@ -340,6 +475,7 @@ fn compare(state: &mut State, record: &Record, goal: &[u8]) -> SortOrder {
         let goal_len = goal.len();
         while index < data_len && state.compression < goal_len
             && data[index] == goal[state.compression] {
+            state.matched_so_far[state.compression] = data[index];
             state.compression += 1;
             index += 1;
         }
