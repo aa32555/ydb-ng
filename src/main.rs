@@ -2,10 +2,18 @@ extern crate ydb_ng;
 extern crate clap;
 extern crate ydb_ng_bridge;
 extern crate fnv;
+extern crate threadpool;
 
-use std::collections::VecDeque;
+use std::collections::{VecDeque, HashSet};
 
 use clap::{Arg, App, ArgMatches};
+use std::mem;
+use std::sync::{Arc, RwLock, Mutex};
+use std::time::Duration;
+use std::thread::sleep;
+use fnv::FnvHashSet;
+use threadpool::ThreadPool;
+use ydb_ng_bridge::ydb::{blk_hdr};
 
 use ydb_ng::*;
 
@@ -55,6 +63,48 @@ fn find_value(matches: &ArgMatches, database: &Database) -> std::io::Result<()> 
     Ok(())
 }
 
+fn do_integ(database: &Mutex<Database>,
+            next: &IntegBlock,
+            to_visit: &RwLock<FnvHashSet<usize>>) -> Result<Vec<IntegBlock>, std::io::Error> {
+    let blk_num = match next.blk_num {
+        BlkNum::Block(x) => x,
+        _ => panic!("Expected a known block; didn't get it"),
+    };
+    to_visit.write().unwrap().remove(&blk_num);
+    //println!("Integ on block {}", blk_num);
+    let blk = database.lock().unwrap().get_block(blk_num)?;
+    let blk = get_block(&blk, blk_num, next.typ.clone()).unwrap();
+    let next_blocks = blk.integ(&next.start).unwrap();
+    Ok(next_blocks)
+}
+
+fn add_block_to_pool(database: &Arc<Mutex<Database>>,
+                     to_visit: &Arc<RwLock<FnvHashSet<usize>>>,
+                     pool: &Arc<Mutex<ThreadPool>>,
+                     blk: IntegBlock) {
+    let next_blocks = do_integ(&database, &blk, &to_visit);
+    let next_blocks = next_blocks.unwrap();
+    for blk in next_blocks {
+        let blk_num = match blk.blk_num {
+            BlkNum::Block(x) => x,
+            _ => panic!("Scanning unknown block!"),
+        };
+        {
+            let mut b_to_visit = to_visit.write().unwrap();
+            if b_to_visit.contains(&blk_num) {
+                b_to_visit.remove(&blk_num);
+                //println!("Adding block to queue: {:?}", blk);
+                let database = database.clone();
+                let to_visit = to_visit.clone();
+                let n_pool = pool.clone();
+                pool.lock().unwrap().execute(move || {
+                    add_block_to_pool(&database, &to_visit, &n_pool, blk);
+                });
+            }
+        }
+    }
+}
+
 fn main() -> std::io::Result<()> {
     let matches = App::new("ydb-ng")
         .version("0.1")
@@ -85,39 +135,71 @@ fn main() -> std::io::Result<()> {
              .long("integ"))                   
         .get_matches();
     // Load the database
-    let database = Database::open(matches.value_of("INPUT").unwrap())?;
+    let database = Arc::new(Mutex::new(Database::open(matches.value_of("INPUT").unwrap())?));
     if matches.is_present("integ") {
-        let queue = IntegQueueType::new(VecDeque::new());
+        let pool = Arc::new(Mutex::new(ThreadPool::new(8)));
+        let to_visit = Arc::new(RwLock::new(FnvHashSet::default()));
+        // Scan through the local maps; when we get an empty one, there are no more. Verify that
+        // they are marked correctly in the master bitmap
+        for i in 0.. {
+            let blk = database.lock().unwrap().get_block(i * 512);
+            // We attempted to read past the end of the database, meaning no more local
+            // bitmaps
+            if blk.is_err() {
+                break;
+            }
+            let blk = blk.unwrap();
+            let blk = &blk[mem::size_of::<blk_hdr>()..];
+            let mut byte_num = 0;
+            let mut block_num = 0;
+            for byte in blk {
+                let byte = byte.clone();
+                // 2 bits for each block, so we have 4 blocks per byte to check
+                for bittle in 0..4 {
+                    // The 0th block is the local bitmap; skip it
+                    if byte & (0b11 << bittle) == 0b00 && block_num != 0 {
+                        let b = i * 512 + (4 * byte_num + (bittle as usize));
+                        //println!("Adding block {} to be scanned", b);
+                        to_visit.write().unwrap().insert(b);
+                    }
+                    block_num += 1;
+                    if block_num == 512 {
+                        break;
+                    }
+                }
+                byte_num += 1;
+                if block_num == 512 {
+                    break;
+                }
+            }
+        }
+        // Add the first block
         {
-            let mut q = queue.write().unwrap();
-            q.push_back(IntegBlock {
+            let blk = IntegBlock {
                 blk_num: BlkNum::Block(1),
                 typ: BlkType::DirectoryTree,
                 start: vec![],
                 end: vec![],
-            });
+            };
+            add_block_to_pool(&database, &to_visit, &pool, blk);
         }
 
         loop {
-            let next = {
-                let mut q = queue.write().unwrap();
-                q.pop_front()
-            };
-            if next.is_none() {
-                break;
+            {
+                let p = pool.lock().unwrap();
+                if p.active_count() == 0  && p.queued_count() == 0 {
+                    break;
+                }
             }
-            let next = next.unwrap();
-            let blk_num = match next.blk_num {
-                BlkNum::Block(x) => x,
-                _ => panic!("Expected a known block; didn't get it"),
-            };
-            println!("Integ on block {}", blk_num);
-            let blk = database.get_block(blk_num)?;
-            let blk = get_block(&blk, blk_num, next.typ).unwrap();
-            blk.integ(&next.start, &queue).unwrap();
+            sleep(Duration::from_micros(500));
+        }
+
+        let t = to_visit.read().unwrap();
+        for blk in t.iter() {
+            println!("Block {} incorrectly marked busy", blk);
         }
     } else {
-        find_value(&matches, &database)?;
+        find_value(&matches, &database.lock().unwrap())?;
     }
     Ok(())
 }

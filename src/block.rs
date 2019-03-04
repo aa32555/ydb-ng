@@ -16,6 +16,7 @@ pub enum BlkType {
     DataBlock,
     LocalBitmap,
     MasterBitmap,
+    Unknown,
 }
 
 /// Represents a database block, trimmed to exactly fit the data in use
@@ -54,11 +55,12 @@ impl<'a> Blk<'a> {
         &self.data
     }
 
-    pub fn integ(&self, start: &[u8], queue: &IntegQueueType) -> Result<(), ValueError> {
+    pub fn integ(&self, start: &[u8]) -> Result<Vec<IntegBlock>, ValueError> {
         // We don't need to scan records for these types, but should verify the blocks they point
         // too
+        let mut queue = Vec::new();
         if self.typ == BlkType::MasterBitmap || self.typ == BlkType::LocalBitmap {
-            return Ok(());
+            return Ok(queue);
         }
         let mut state = State{compression: 0, goal: start};
         let rc = RecordCursor::new(&self);
@@ -86,30 +88,34 @@ impl<'a> Blk<'a> {
             // If needed, add the pointer of this block to be scanned
             // TODO: we should detect loops
             //println!("Here! {:#?}", self);
-            if self.typ == BlkType::IndexBlock || self.typ == BlkType::DirectoryTree {
-                let mut queue = queue.write().unwrap();
-                // TODO: we need to fetch the local bitmap for the next block to look at these
-                // things
-                let typ = match self.header.levl {
-                    0 => BlkType::IndexBlock,
-                    1 => {
-                        if self.typ == BlkType::DirectoryTree {
-                            BlkType::IndexBlock
-                        } else {
-                            BlkType::DataBlock
-                        }
-                    },
-                    _ => BlkType::IndexBlock,
-                };
-                queue.push_back(IntegBlock {
-                    blk_num: record.ptr(),
-                    typ,
-                    start: start,
-                    end: end,
-                });
+            if self.typ != BlkType::DataBlock {
+                let mut typ = BlkType::DataBlock;
+                if self.typ == BlkType::DirectoryTree {
+                    typ = match self.header.levl {
+                        0 => BlkType::IndexBlock,
+                        _ => BlkType::DirectoryTree,
+                    };
+                } else if self.typ == BlkType::IndexBlock {
+                    typ = match self.header.levl {
+                        1 => BlkType::DataBlock,
+                        _ => BlkType::IndexBlock,
+                    };
+                }
+                let blk_num = record.ptr();
+                if blk_num.is_err() {
+                    println!("Problem parsing block num {:?}, record {:?}", self.blk_num, record);
+                    return Err(blk_num.err().unwrap());
+                } else {
+                    queue.push(IntegBlock {
+                        blk_num: blk_num.unwrap(),
+                        typ: typ,
+                        start: start,
+                        end: end,
+                    });
+                }
             }
         }
-        Ok(())
+        Ok(queue)
     }
 }
 

@@ -26,10 +26,10 @@ named_args!(pub(crate) record_header<'a>(offset: usize)<RawRec>,
 );
 
 impl<'a> RawRec<'a> {
-    pub fn ptr(&self) -> BlkNum {
+    pub fn ptr(&self) -> Result<BlkNum, ValueError> {
         let ret;
         let data = self.data;
-        if data.len() == 4 {
+        if self.header.rsiz == 8 {
             // This is a * record; transmute the data to be a little endian int
             let data = &self.data[self.data.len() - 4..self.data.len()];
             let block = unsafe {
@@ -42,6 +42,9 @@ impl<'a> RawRec<'a> {
         } else {
             // Fetch the tail end of the pointer, and transmute it
             let data = &self.data();
+            if data.len() < 4 {
+                return Err(ValueError::MalformedRecord);
+            }
             let block = unsafe {
                 mem::transmute::<[u8; 4], u32>([data[0],
                                                        data[1],
@@ -50,7 +53,7 @@ impl<'a> RawRec<'a> {
             ])};
             ret = BlkNum::Block(block as usize);
         }
-        ret
+        Ok(ret)
     }
 
     pub fn data(&self) -> &[u8] {

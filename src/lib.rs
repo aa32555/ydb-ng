@@ -29,6 +29,7 @@ static PHYSICAL_DATABASE_BLOCK_SIZE: i32 = 512;
 
 pub type IntegQueueType = RwLock<VecDeque<IntegBlock>>;
 
+#[derive(Debug, Clone, PartialEq)]
 pub struct IntegBlock {
     pub blk_num: BlkNum,
     pub typ: BlkType,
@@ -49,6 +50,14 @@ pub enum SortOrder {
     SortsAfter,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum LocalBitmapStatus {
+    Busy,
+    NeverUsed,
+    Invalid,
+    Free,
+}
+
 #[derive(Debug, Clone)]
 pub struct State<'a> {
     pub(crate) compression: usize,
@@ -62,6 +71,8 @@ pub enum ValueError {
     GlobalNotFound,
     SubscriptNotFound,
     MalformedRecord,
+    BlockIncorrectlyMarkedFree,
+    BlockIncorrectlyMarkedBusy,
 }
 
 #[derive(Debug)]
@@ -97,6 +108,20 @@ impl From<RecordError> for ValueError {
 }
 
 impl Database {
+    pub fn local_block_status(&self, blk_num: usize) -> Result<LocalBitmapStatus, ValueError> {
+        // Get the local bitmap closest to that block; they occur every 512 blocks, so at 0, 511,
+        // 1023, etc. divide blk_nu by 512, then multiply by 512
+        let bm_blk_num = blk_num / 512;
+        let bm_blk_num = bm_blk_num * 512;
+        let blk = self.get_block(blk_num)?;
+        Ok(match blk[blk_num - bm_blk_num] {
+            0 => LocalBitmapStatus::Busy,
+            1 => LocalBitmapStatus::NeverUsed,
+            3 => LocalBitmapStatus::Free,
+            _ => LocalBitmapStatus::Invalid,
+        })
+    }
+
     // We should check some sort of cache here for the block
     pub fn get_block(&self, blk_num: usize) -> std::io::Result<Vec<u8>> {
         //let mut ret = vec!([0; fhead.blk_size]);
@@ -228,7 +253,7 @@ impl Database {
                 _ => false,
             };
             if found == true {
-                next_block = match record.ptr() {
+                next_block = match record.ptr().unwrap() {
                     BlkNum::Block(x) => x,
                     _ => 0,
                 };
@@ -253,7 +278,7 @@ impl Database {
                 _ => false,
             };
             if found == true {
-                next_block = match record.ptr() {
+                next_block = match record.ptr().unwrap() {
                     BlkNum::Block(x) => x,
                     _ => 0,
                 };
@@ -284,7 +309,7 @@ impl Database {
                     _ => false,
                 };
                 if found == true {
-                    next_block = match record.ptr() {
+                    next_block = match record.ptr().unwrap() {
                         BlkNum::Block(x) => x,
                         _ => 0,
                     };
