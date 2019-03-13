@@ -77,7 +77,7 @@ impl<'a> Blk<'a> {
             let start = goal.clone();
             // Verify that this record sorts after the previous record
             let sorts = RecordCursor::compare(&record, &mut state);
-            RecordCursor::expand_key(&record, &mut goal)?;
+            //RecordCursor::expand_key(&record, &mut goal)?;
             // Note down where we end
             let end = goal.clone();
             if RecordCursor::compare_strings(&start, &end) == SortOrder::SortsAfter
@@ -169,7 +169,7 @@ impl<'a> RecordCursor<'a> {
             cmpc +=1;
             i += 1;
         }
-        if i + 1 == data.len() {
+        if i + 1 > data.len() {
             return Err(ValueError::RecordError(RecordError::NoTerminatingCharacter));
         }
         unsafe {

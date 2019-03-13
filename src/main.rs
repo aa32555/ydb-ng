@@ -3,12 +3,14 @@ extern crate clap;
 extern crate ydb_ng_bridge;
 extern crate fnv;
 extern crate threadpool;
+extern crate spin;
 
 use std::collections::{VecDeque, HashSet};
 
 use clap::{Arg, App, ArgMatches};
 use std::mem;
-use std::sync::{Arc, RwLock, Mutex};
+use std::sync::{Arc};
+use spin::Mutex;
 use std::time::Duration;
 use std::thread::sleep;
 use fnv::FnvHashSet;
@@ -65,42 +67,51 @@ fn find_value(matches: &ArgMatches, database: &Database) -> std::io::Result<()> 
 
 fn do_integ(database: &Mutex<Database>,
             next: &IntegBlock,
-            to_visit: &RwLock<FnvHashSet<usize>>) -> Result<Vec<IntegBlock>, std::io::Error> {
+            to_visit: &Mutex<FnvHashSet<usize>>) -> Result<Vec<IntegBlock>, std::io::Error> {
     let blk_num = match next.blk_num {
         BlkNum::Block(x) => x,
         _ => panic!("Expected a known block; didn't get it"),
     };
-    to_visit.write().unwrap().remove(&blk_num);
+    to_visit.lock().remove(&blk_num);
     //println!("Integ on block {}", blk_num);
-    let blk = database.lock().unwrap().get_block(blk_num)?;
+    let blk = database.lock().get_block(blk_num)?;
     let blk = get_block(&blk, blk_num, next.typ.clone()).unwrap();
     let next_blocks = blk.integ(&next.start).unwrap();
     Ok(next_blocks)
 }
 
 fn add_block_to_pool(database: &Arc<Mutex<Database>>,
-                     to_visit: &Arc<RwLock<FnvHashSet<usize>>>,
+                     to_visit: &Arc<Mutex<FnvHashSet<usize>>>,
                      pool: &Arc<Mutex<ThreadPool>>,
                      blk: IntegBlock) {
     let next_blocks = do_integ(&database, &blk, &to_visit);
     let next_blocks = next_blocks.unwrap();
-    for blk in next_blocks {
-        let blk_num = match blk.blk_num {
-            BlkNum::Block(x) => x,
-            _ => panic!("Scanning unknown block!"),
-        };
-        {
-            let mut b_to_visit = to_visit.write().unwrap();
-            if b_to_visit.contains(&blk_num) {
-                b_to_visit.remove(&blk_num);
-                //println!("Adding block to queue: {:?}", blk);
-                let database = database.clone();
-                let to_visit = to_visit.clone();
-                let n_pool = pool.clone();
-                pool.lock().unwrap().execute(move || {
-                    add_block_to_pool(&database, &to_visit, &n_pool, blk);
-                });
+    let mut blocks_to_queue = Vec::with_capacity(next_blocks.len());
+    {
+        let mut b_to_visit = to_visit.lock();
+        for blk in next_blocks {
+            let blk_num = match blk.blk_num {
+                BlkNum::Block(x) => x,
+                _ => panic!("Scanning unknown block!"),
+            };
+            {
+                if b_to_visit.contains(&blk_num) {
+                    b_to_visit.remove(&blk_num);
+                    blocks_to_queue.push(blk);
+                    //println!("Adding block to queue: {:?}", blk);
+                }
             }
+        }
+    }
+    {
+        let l_pool = pool.lock();
+        for blk in blocks_to_queue {
+            let database = database.clone();
+            let to_visit = to_visit.clone();
+            let n_pool = pool.clone();
+            l_pool.execute(move || {
+                add_block_to_pool(&database, &to_visit, &n_pool, blk);
+            });
         }
     }
 }
@@ -133,16 +144,21 @@ fn main() -> std::io::Result<()> {
              .help("Runs an integrity check on all blocks")
              .short("i")
              .long("integ"))                   
+        .arg(Arg::with_name("integ-threads")
+             .help("Number of concurrent threads to use for integrity check")
+             .short("t")
+             .long("integ-threads")
+             .takes_value(true))
         .get_matches();
     // Load the database
     let database = Arc::new(Mutex::new(Database::open(matches.value_of("INPUT").unwrap())?));
     if matches.is_present("integ") {
-        let pool = Arc::new(Mutex::new(ThreadPool::new(8)));
-        let to_visit = Arc::new(RwLock::new(FnvHashSet::default()));
+        let pool = Arc::new(Mutex::new(ThreadPool::new(4)));
+        let to_visit = Arc::new(Mutex::new(FnvHashSet::default()));
         // Scan through the local maps; when we get an empty one, there are no more. Verify that
         // they are marked correctly in the master bitmap
         for i in 0.. {
-            let blk = database.lock().unwrap().get_block(i * 512);
+            let blk = database.lock().get_block(i * 512);
             // We attempted to read past the end of the database, meaning no more local
             // bitmaps
             if blk.is_err() {
@@ -157,10 +173,10 @@ fn main() -> std::io::Result<()> {
                 // 2 bits for each block, so we have 4 blocks per byte to check
                 for bittle in 0..4 {
                     // The 0th block is the local bitmap; skip it
-                    if byte & (0b11 << bittle) == 0b00 && block_num != 0 {
+                    if byte & (0b11 << (2*bittle)) == 0b00 && block_num != 0 {
                         let b = i * 512 + (4 * byte_num + (bittle as usize));
                         //println!("Adding block {} to be scanned", b);
-                        to_visit.write().unwrap().insert(b);
+                        to_visit.lock().insert(b);
                     }
                     block_num += 1;
                     if block_num == 512 {
@@ -186,20 +202,20 @@ fn main() -> std::io::Result<()> {
 
         loop {
             {
-                let p = pool.lock().unwrap();
+                let p = pool.lock();
                 if p.active_count() == 0  && p.queued_count() == 0 {
                     break;
                 }
             }
-            sleep(Duration::from_micros(500));
+            sleep(Duration::from_millis(100));
         }
 
-        let t = to_visit.read().unwrap();
+        let t = to_visit.lock();
         for blk in t.iter() {
             println!("Block {} incorrectly marked busy", blk);
         }
     } else {
-        find_value(&matches, &database.lock().unwrap())?;
+        find_value(&matches, &database.lock())?;
     }
     Ok(())
 }
